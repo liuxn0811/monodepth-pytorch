@@ -74,7 +74,7 @@ class ToTensor(object):
 
 class RandomFlip(object):
     def __init__(self, do_augmentation):
-        self.transform = transforms.RandomHorizontalFlip(p=1)
+        self.transform = transforms.RandomHorizontalFlip()
         self.do_augmentation = do_augmentation
 
     def __call__(self, sample):

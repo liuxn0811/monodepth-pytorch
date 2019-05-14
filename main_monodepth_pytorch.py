@@ -2,10 +2,15 @@ import argparse
 import time
 import torch
 import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-
+import os
+import itertools
+# develop branch
 # custom modules
-
+os.environ['CUDA_DEVICE_ORDER']='PCI_BUS_ID'
+os.environ['CUDA_VISIBLE_DEVICES']='5,6'
 from loss import MonodepthLoss
 from utils import get_model, to_device, prepare_dataloader
 
@@ -14,25 +19,27 @@ from utils import get_model, to_device, prepare_dataloader
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 mpl.rcParams['figure.figsize'] = (15, 10)
-
+import multiprocessing
+multiprocessing.set_start_method('spawn', True)
 
 def return_arguments():
     parser = argparse.ArgumentParser(description='PyTorch Monodepth')
 
-    parser.add_argument('data_dir',
+    parser.add_argument('--data_dir',default='/media/public/disk2/liu/kitti_raw_data/train',
                         help='path to the dataset folder. \
                         It should contain subfolders with following structure:\
                         "image_02/data" for left images and \
                         "image_03/data" for right images'
                         )
-    parser.add_argument('val_data_dir',
+    parser.add_argument('--val_data_dir',default='/media/public/disk2/liu/kitti_raw_data/val',
                         help='path to the validation dataset folder. \
                             It should contain subfolders with following structure:\
                             "image_02/data" for left images and \
                             "image_03/data" for right images'
                         )
-    parser.add_argument('model_path', help='path to the trained model')
-    parser.add_argument('output_directory',
+    parser.add_argument('--model_path',default='./models1/all/forward.pth', help='path to the trained model')
+    parser.add_argument('--Bmodel_path',default='./models1/all/backward.pth', help='path to the trained model')
+    parser.add_argument('--output_directory',default='./data/raw_output1',
                         help='where save dispairities\
                         for tested images'
                         )
@@ -45,16 +52,28 @@ def return_arguments():
                         'resnet18_md or resnet50_md ' + '(default: resnet18)'
                         + 'or torchvision version of any resnet model'
                         )
+    parser.add_argument('--Bmodel', default='resnet18_md',
+                        help='encoder architecture: ' +
+                        'resnet18_md or resnet50_md ' + '(default: resnet18)'
+                        + 'or torchvision version of any resnet model'
+                        )
     parser.add_argument('--pretrained', default=False,
+                        help='Use weights of pretrained model'
+                        )
+    parser.add_argument('--Bpretrained', default=False,
                         help='Use weights of pretrained model'
                         )
     parser.add_argument('--mode', default='train',
                         help='mode: train or test (default: train)')
-    parser.add_argument('--epochs', default=50,
+    parser.add_argument('--epoch1', default=20,
+                        help='number of total epochs to run')
+    parser.add_argument('--epoch2', default=15,
+                        help='number of total epochs to run')
+    parser.add_argument('--epoch3', default=20,
                         help='number of total epochs to run')
     parser.add_argument('--learning_rate', default=1e-4,
                         help='initial learning rate (default: 1e-4)')
-    parser.add_argument('--batch_size', default=256,
+    parser.add_argument('--batch_size', default=8,
                         help='mini-batch size (default: 256)')
     parser.add_argument('--adjust_lr', default=True,
                         help='apply learning rate decay or not\
@@ -87,7 +106,7 @@ def return_arguments():
                         help='Number of channels in input tensor')
     parser.add_argument('--num_workers', default=4,
                         help='Number of workers in dataloader')
-    parser.add_argument('--use_multiple_gpu', default=False)
+    parser.add_argument('--use_multiple_gpu', default=True)
     args = parser.parse_args()
     return args
 
@@ -125,9 +144,12 @@ class Model:
         # Set up model
         self.device = args.device
         self.model = get_model(args.model, input_channels=args.input_channels, pretrained=args.pretrained)
+        self.backward = get_model(args.Bmodel, input_channels=args.input_channels, pretrained=args.Bpretrained)
         self.model = self.model.to(self.device)
+        self.backward = self.backward.to(self.device)
         if args.use_multiple_gpu:
             self.model = torch.nn.DataParallel(self.model)
+            self.backward = torch.nn.DataParallel(self.backward)
 
         if args.mode == 'train':
             self.loss_function = MonodepthLoss(
@@ -136,6 +158,9 @@ class Model:
                 disp_gradient_w=0.1, lr_w=1).to(self.device)
             self.optimizer = optim.Adam(self.model.parameters(),
                                         lr=args.learning_rate)
+            self.Boptimizer = optim.Adam(self.backward.parameters(),
+                                        lr=args.learning_rate)
+            self.Goptimizer = optim.Adam (itertools.chain(self.model.parameters(), self.backward.parameters()),lr=args.learning_rate)
             self.val_n_img, self.val_loader = prepare_dataloader(args.val_data_dir, args.mode,
                                                                  args.augment_parameters,
                                                                  False, args.batch_size,
@@ -143,6 +168,7 @@ class Model:
                                                                  args.num_workers)
         else:
             self.model.load_state_dict(torch.load(args.model_path))
+            #self.backward.load_state_dict(torch.load(args.Bmodel_path))
             args.augment_parameters = None
             args.do_augmentation = False
             args.batch_size = 1
@@ -161,7 +187,61 @@ class Model:
         if 'cuda' in self.device:
             torch.cuda.synchronize()
 
+    
+    def freeze_model(self,model):
+        model.eval()
+        for params in model.parameters():
+            params.requires_grad = False
+    
+    def unfreeze_model(self,model):
+        model.train()
+        for params in model.parameters():
+            params.requires_grad = True
+    
+    def img_pyramid(self, img, num_scales):
+        scaled_imgs = [img]
+        s = img.size()
+        h = s[2]
+        w = s[3]
+        for i in range(num_scales - 1):
+            ratio = 2 ** (i + 1)
+            nh = h // ratio
+            nw = w // ratio
+            scaled_imgs.append(nn.functional.interpolate(img,
+                               size=[nh, nw], mode='bilinear',
+                               align_corners=True))
+        return scaled_imgs
+    
+    def apply_disp(self, img, disp):
+        batch_size, _, height, width = img.size()
 
+        # Original coordinates of pixels
+        x_base = torch.linspace(0, 1, width).repeat(batch_size,
+                    height, 1).type_as(img)
+        y_base = torch.linspace(0, 1, height).repeat(batch_size,
+                    width, 1).transpose(1, 2).type_as(img)
+
+        # Apply shift in X direction
+        x_shifts = disp[:, 0, :, :]  # Disparity is passed in NCHW format with 1 channel
+        flow_field = torch.stack((x_base + x_shifts, y_base), dim=3)
+        # In grid_sample coordinates are assumed to be between -1 and 1
+        output = F.grid_sample(img, 2*flow_field - 1, mode='bilinear',
+                               padding_mode='zeros')
+
+        return output
+
+    def generate_image_left(self, img, disp):
+        pyramid = self.img_pyramid(img, 4)
+        disp_left_est = [d[:, 0, :, :].unsqueeze(1) for d in disp]
+        left_est = [self.apply_disp(pyramid[i],-disp_left_est[i]) for i in range(4)]
+        return left_est
+
+    def generate_image_right(self, img, disp):
+        pyramid = self.img_pyramid(img, 4)
+        disp_right_est = [d[:, 1, :, :].unsqueeze(1) for d in disp]
+        right_est = [self.apply_disp(pyramid[i],disp_right_est[i]) for i in range(4)]
+        return right_est
+    
     def train(self):
         losses = []
         val_losses = []
@@ -169,26 +249,30 @@ class Model:
         best_val_loss = float('Inf')
 
         running_val_loss = 0.0
-        self.model.eval()
+        self.freeze_model(self.model)
+        #self.freeze_model(self.backward)
         for data in self.val_loader:
+            
             data = to_device(data, self.device)
             left = data['left_image']
             right = data['right_image']
             disps = self.model(left)
-            loss = self.loss_function(disps, [left, right])
+            #righti = self.generate_image_right(left,disps)
+            #disps1 = self.backward(righti[0])
+            loss = self.loss_function(disps, disps, [left, right],'forward')
             val_losses.append(loss.item())
             running_val_loss += loss.item()
 
         running_val_loss /= self.val_n_img / self.args.batch_size
         print('Val_loss:', running_val_loss)
 
-        for epoch in range(self.args.epochs):
+        for epoch in range(self.args.epoch1):
             if self.args.adjust_lr:
                 adjust_learning_rate(self.optimizer, epoch,
                                      self.args.learning_rate)
             c_time = time.time()
             running_loss = 0.0
-            self.model.train()
+            self.unfreeze_model(self.model)
             for data in self.loader:
                 # Load data
                 data = to_device(data, self.device)
@@ -198,56 +282,20 @@ class Model:
                 # One optimization iteration
                 self.optimizer.zero_grad()
                 disps = self.model(left)
-                loss = self.loss_function(disps, [left, right])
+                loss = self.loss_function(disps,disps, [left, right],'forward')
                 loss.backward()
                 self.optimizer.step()
                 losses.append(loss.item())
-
-                # Print statistics
-                if self.args.print_weights:
-                    j = 1
-                    for (name, parameter) in self.model.named_parameters():
-                        if name.split(sep='.')[-1] == 'weight':
-                            plt.subplot(5, 9, j)
-                            plt.hist(parameter.data.view(-1))
-                            plt.xlim([-1, 1])
-                            plt.title(name.split(sep='.')[0])
-                            j += 1
-                    plt.show()
-
-                if self.args.print_images:
-                    print('disp_left_est[0]')
-                    plt.imshow(np.squeeze(
-                        np.transpose(self.loss_function.disp_left_est[0][0,
-                                     :, :, :].cpu().detach().numpy(),
-                                     (1, 2, 0))))
-                    plt.show()
-                    print('left_est[0]')
-                    plt.imshow(np.transpose(self.loss_function\
-                        .left_est[0][0, :, :, :].cpu().detach().numpy(),
-                        (1, 2, 0)))
-                    plt.show()
-                    print('disp_right_est[0]')
-                    plt.imshow(np.squeeze(
-                        np.transpose(self.loss_function.disp_right_est[0][0,
-                                     :, :, :].cpu().detach().numpy(),
-                                     (1, 2, 0))))
-                    plt.show()
-                    print('right_est[0]')
-                    plt.imshow(np.transpose(self.loss_function.right_est[0][0,
-                               :, :, :].cpu().detach().numpy(), (1, 2,
-                               0)))
-                    plt.show()
                 running_loss += loss.item()
 
             running_val_loss = 0.0
-            self.model.eval()
+            self.freeze_model(self.model)
             for data in self.val_loader:
                 data = to_device(data, self.device)
                 left = data['left_image']
                 right = data['right_image']
                 disps = self.model(left)
-                loss = self.loss_function(disps, [left, right])
+                loss = self.loss_function(disps, disps, [left, right], 'forward')
                 val_losses.append(loss.item())
                 running_val_loss += loss.item()
 
@@ -265,17 +313,139 @@ class Model:
                 round(time.time() - c_time, 3),
                 's',
                 )
-            self.save(self.args.model_path[:-4] + '_last.pth')
+            self.save('./models1/forward/' + str(epoch+1)+'.pth')
             if running_val_loss < best_val_loss:
-                self.save(self.args.model_path[:-4] + '_cpt.pth')
+                self.save('./models1/forward/'+ 'cpt.pth')
                 best_val_loss = running_val_loss
                 print('Model_saved')
+        
+        for epoch in range(self.args.epoch2):
+            if self.args.adjust_lr:
+                adjust_learning_rate(self.Boptimizer, epoch,
+                                     self.args.learning_rate)
+            c_time = time.time()
+            running_loss = 0.0
+            self.unfreeze_model(self.backward)
+            for data in self.loader:
+                # Load data
+                data = to_device(data, self.device)
+                left = data['left_image']
+                right = data['right_image']
 
+                # One optimization iteration
+                self.Boptimizer.zero_grad()
+                disps = self.model(left)
+                righti = self.generate_image_right(left,disps)
+                disps1 = self.backward(righti[0])
+                loss = self.loss_function(disps,disps1, [left, right],'backward')
+                loss.backward()
+                self.Boptimizer.step()
+                losses.append(loss.item())
+                running_loss += loss.item()
+
+            running_val_loss = 0.0
+            self.freeze_model(self.backward)
+            for data in self.val_loader:
+                data = to_device(data, self.device)
+                left = data['left_image']
+                right = data['right_image']
+                disps = self.model(left)
+                righti = self.generate_image_right(left,disps)
+                disps1 = self.backward(righti[0])
+                loss = self.loss_function(disps,disps1, [left, right],'backward')
+                val_losses.append(loss.item())
+                running_val_loss += loss.item()
+
+            # Estimate loss per image
+            running_loss /= self.n_img / self.args.batch_size
+            running_val_loss /= self.val_n_img / self.args.batch_size
+            print (
+                'Epoch:',
+                epoch + 1,
+                'train_loss:',
+                running_loss,
+                'val_loss:',
+                running_val_loss,
+                'time:',
+                round(time.time() - c_time, 3),
+                's',
+                )
+            self.save('./models1/backward/' + str(epoch+1)+'.pth')
+            if running_val_loss < best_val_loss:
+                self.save('./models1/backward/' + 'cpt.pth')
+                best_val_loss = running_val_loss
+                print('Model_saved')
+        
+        for epoch in range(self.args.epoch3):
+            if self.args.adjust_lr:
+                adjust_learning_rate(self.Goptimizer, epoch,
+                                     self.args.learning_rate)
+            c_time = time.time()
+            running_loss = 0.0
+            self.unfreeze_model(self.model)
+            self.unfreeze_model(self.backward)
+            for data in self.loader:
+                # Load data
+                data = to_device(data, self.device)
+                left = data['left_image']
+                right = data['right_image']
+
+                # One optimization iteration
+                self.Goptimizer.zero_grad()
+                disps = self.model(left)
+                righti = self.generate_image_right(left,disps)
+                disps1 = self.backward(righti[0])
+                loss = self.loss_function(disps,disps1, [left, right],'all')
+                loss.backward()
+                self.Goptimizer.step()
+                losses.append(loss.item())
+                running_loss += loss.item()
+
+            running_val_loss = 0.0
+            self.freeze_model(self.model)
+            self.freeze_model(self.backward)
+            for data in self.val_loader:
+                data = to_device(data, self.device)
+                left = data['left_image']
+                right = data['right_image']
+                disps = self.model(left)
+                righti = self.generate_image_right(left,disps)
+                disps1 = self.backward(righti[0])
+                loss = self.loss_function(disps,disps1, [left, right],'all')
+                
+                val_losses.append(loss.item())
+                running_val_loss += loss.item()
+
+            # Estimate loss per image
+            running_loss /= self.n_img / self.args.batch_size
+            running_val_loss /= self.val_n_img / self.args.batch_size
+            print (
+                'Epoch:',
+                epoch + 1,
+                'train_loss:',
+                running_loss,
+                'val_loss:',
+                running_val_loss,
+                'time:',
+                round(time.time() - c_time, 3),
+                's',
+                )
+            self.save('./models1/all/' + str(epoch+1)+'_forward.pth')
+            self.Bsave('./models1/all/' + str(epoch+1)+'_backward.pth')
+            if running_val_loss < best_val_loss:
+                self.save(self.args.model_path[:-4] + '_cpt.pth')
+                self.Bsave(self.args.Bmodel_path[:-4] + '_cpt.pth')
+                best_val_loss = running_val_loss
+                print('Model_saved')
         print ('Finished Training. Best loss:', best_loss)
         self.save(self.args.model_path)
+        self.Bsave(self.args.Bmodel_path)
 
     def save(self, path):
         torch.save(self.model.state_dict(), path)
+
+    def Bsave(self, path):
+        torch.save(self.backward.state_dict(), path)
 
     def load(self, path):
         self.model.load_state_dict(torch.load(path))
@@ -307,7 +477,7 @@ class Model:
         print('Finished Testing')
 
 
-def main(args):
+def main():
     args = return_arguments()
     if args.mode == 'train':
         model = Model(args)

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class MonodepthLoss(nn.modules.Module):
-    def __init__(self, n=4, SSIM_w=0.85, disp_gradient_w=1.0, lr_w=1.0):
+    def __init__(self, n=4, SSIM_w=0.85, disp_gradient_w=0.1, lr_w=1.0):
         super(MonodepthLoss, self).__init__()
         self.SSIM_w = SSIM_w
         self.disp_gradient_w = disp_gradient_w
@@ -101,7 +101,7 @@ class MonodepthLoss(nn.modules.Module):
         return [torch.abs(smoothness_x[i]) + torch.abs(smoothness_y[i])
                 for i in range(self.n)]
 
-    def forward(self, input, target):
+    def forward(self, input, input1, target, mode):
         """
         Args:
             input [disp1, disp2, disp3, disp4]
@@ -120,6 +120,12 @@ class MonodepthLoss(nn.modules.Module):
 
         self.disp_left_est = disp_left_est
         self.disp_right_est = disp_right_est
+
+        disp_left_est1 = [d[:, 0, :, :].unsqueeze(1) for d in input1]
+        disp_right_est1 = [d[:, 1, :, :].unsqueeze(1) for d in input1]
+
+        self.disp_left_est1 = disp_left_est1
+        self.disp_right_est1 = disp_right_est1
         # Generate images
         left_est = [self.generate_image_left(right_pyramid[i],
                     disp_left_est[i]) for i in range(self.n)]
@@ -128,11 +134,23 @@ class MonodepthLoss(nn.modules.Module):
         self.left_est = left_est
         self.right_est = right_est
 
+        left_est1 = [self.generate_image_left(left_est[i],
+                    disp_left_est1[i]) for i in range(self.n)]
+        right_est1 = [self.generate_image_right(right_est[i],
+                     disp_right_est1[i]) for i in range(self.n)]
+        self.left_est1 = left_est1
+        self.right_est1 = right_est1
+
         # L-R Consistency
         right_left_disp = [self.generate_image_left(disp_right_est[i],
                            disp_left_est[i]) for i in range(self.n)]
         left_right_disp = [self.generate_image_right(disp_left_est[i],
                            disp_right_est[i]) for i in range(self.n)]
+        
+        right_left_disp1 = [self.generate_image_left(disp_right_est1[i],
+                           disp_left_est1[i]) for i in range(self.n)]
+        left_right_disp1 = [self.generate_image_right(disp_left_est1[i],
+                           disp_right_est1[i]) for i in range(self.n)]
 
         # Disparities smoothness
         disp_left_smoothness = self.disp_smoothness(disp_left_est,
@@ -140,10 +158,20 @@ class MonodepthLoss(nn.modules.Module):
         disp_right_smoothness = self.disp_smoothness(disp_right_est,
                                                      right_pyramid)
 
+        disp_left_smoothness1 = self.disp_smoothness(disp_left_est1,
+                                                    left_pyramid)
+        disp_right_smoothness1 = self.disp_smoothness(disp_right_est1,
+                                                     right_pyramid)                                             
+
         # L1
         l1_left = [torch.mean(torch.abs(left_est[i] - left_pyramid[i]))
                    for i in range(self.n)]
         l1_right = [torch.mean(torch.abs(right_est[i]
+                    - right_pyramid[i])) for i in range(self.n)]
+        
+        l1_left1 = [torch.mean(torch.abs(left_est1[i] - left_pyramid[i]))
+                   for i in range(self.n)]
+        l1_right1 = [torch.mean(torch.abs(right_est1[i]
                     - right_pyramid[i])) for i in range(self.n)]
 
         # SSIM
@@ -160,12 +188,31 @@ class MonodepthLoss(nn.modules.Module):
                             for i in range(self.n)]
         image_loss = sum(image_loss_left + image_loss_right)
 
+        ssim_left1 = [torch.mean(self.SSIM(left_est1[i],
+                     left_pyramid[i])) for i in range(self.n)]
+        ssim_right1 = [torch.mean(self.SSIM(right_est1[i],
+                      right_pyramid[i])) for i in range(self.n)]
+
+        image_loss_left1 = [self.SSIM_w * ssim_left1[i]
+                           + (1 - self.SSIM_w) * l1_left1[i]
+                           for i in range(self.n)]
+        image_loss_right1 = [self.SSIM_w * ssim_right1[i]
+                            + (1 - self.SSIM_w) * l1_right1[i]
+                            for i in range(self.n)]
+        image_loss1 = sum(image_loss_left1 + image_loss_right1)
+
         # L-R Consistency
         lr_left_loss = [torch.mean(torch.abs(right_left_disp[i]
                         - disp_left_est[i])) for i in range(self.n)]
         lr_right_loss = [torch.mean(torch.abs(left_right_disp[i]
                          - disp_right_est[i])) for i in range(self.n)]
         lr_loss = sum(lr_left_loss + lr_right_loss)
+
+        lr_left_loss1 = [torch.mean(torch.abs(right_left_disp1[i]
+                        - disp_left_est1[i])) for i in range(self.n)]
+        lr_right_loss1 = [torch.mean(torch.abs(left_right_disp1[i]
+                         - disp_right_est1[i])) for i in range(self.n)]
+        lr_loss1 = sum(lr_left_loss1 + lr_right_loss1)
 
         # Disparities smoothness
         disp_left_loss = [torch.mean(torch.abs(
@@ -176,9 +223,32 @@ class MonodepthLoss(nn.modules.Module):
                            for i in range(self.n)]
         disp_gradient_loss = sum(disp_left_loss + disp_right_loss)
 
+        disp_left_loss1 = [torch.mean(torch.abs(
+                          disp_left_smoothness1[i])) / 2 ** i
+                          for i in range(self.n)]
+        disp_right_loss1 = [torch.mean(torch.abs(
+                           disp_right_smoothness1[i])) / 2 ** i
+                           for i in range(self.n)]
+        disp_gradient_loss1 = sum(disp_left_loss1 + disp_right_loss1)
+
         loss = image_loss + self.disp_gradient_w * disp_gradient_loss\
                + self.lr_w * lr_loss
+        loss1 = image_loss1 + self.disp_gradient_w * disp_gradient_loss1\
+               + self.lr_w * lr_loss1
         self.image_loss = image_loss
         self.disp_gradient_loss = disp_gradient_loss
         self.lr_loss = lr_loss
-        return loss
+        
+        dis_left = [torch.mean(torch.abs(disp_left_est[i] - disp_left_est1[i])) for i in range(self.n)]
+        dis_right = [torch.mean(torch.abs(disp_right_est[i] - disp_right_est1[i])) for i in range(self.n)] 
+        disp_loss = [(dis_left[i] + dis_right[i])/2 for i in range(self.n)]
+        
+        
+        if mode == 'forward':
+            return loss
+        if mode == 'backward':
+            return loss1
+        if mode == 'all':
+            return loss*0.5+loss1*0.25+disp_loss*0.25
+   
+
